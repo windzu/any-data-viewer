@@ -25,8 +25,11 @@ export default function PcdViewerPage() {
         setError(null);
         setModel(null); // Clear previous model
 
-        if (!file.name.endsWith('.pcd')) {
-            setError('请上传有效的 PCD 文件（.pcd 格式）。');
+        const isPCD = file.name.toLowerCase().endsWith('.pcd');
+        const isBIN = file.name.toLowerCase().endsWith('.bin');
+
+        if (!isPCD && !isBIN) {
+            setError('请上传有效的 PCD 或 BIN 文件（.pcd / .bin 格式）。');
             setIsLoading(false);
             return;
         }
@@ -34,38 +37,88 @@ export default function PcdViewerPage() {
         const reader = new FileReader();
         reader.onload = async (event) => {
             try {
-                if (event.target?.result) {
+                if (!event.target?.result) return;
+
+                if (isPCD) {
+                    // Parse PCD
                     const loader = new PCDLoader();
                     const loadedModel = loader.parse(event.target.result as ArrayBuffer);
-
-                    // Apply point size and color based on data if available
                     if (loadedModel instanceof THREE.Points) {
                         (loadedModel.material as THREE.PointsMaterial).size = pointSize;
                         if (loadedModel.geometry.hasAttribute('color')) {
                             (loadedModel.material as THREE.PointsMaterial).vertexColors = true;
                         } else {
                             (loadedModel.material as THREE.PointsMaterial).vertexColors = false;
-                            // Default color if no vertex colors
                             (loadedModel.material as THREE.PointsMaterial).color = new THREE.Color(0x00ff00);
                         }
                     }
                     setModel(loadedModel);
+                } else if (isBIN) {
+                    // Parse BIN (assume float32 xyzi)
+                    const buffer = event.target.result as ArrayBuffer;
+                    const floatArray = new Float32Array(buffer);
+                    if (floatArray.length % 4 !== 0) {
+                        throw new Error(`无法按 xyzi 解析：数据长度 ${floatArray.length} 不是4的倍数。`);
+                    }
+                    const numPoints = floatArray.length / 4;
+                    const positions = new Float32Array(numPoints * 3);
+                    const colors = new Float32Array(numPoints * 3);
+
+                    // First pass: intensity range
+                    let minI = Number.POSITIVE_INFINITY;
+                    let maxI = Number.NEGATIVE_INFINITY;
+                    for (let i = 0; i < floatArray.length; i += 4) {
+                        const intensity = floatArray[i + 3];
+                        if (intensity < minI) minI = intensity;
+                        if (intensity > maxI) maxI = intensity;
+                    }
+                    const rangeI = maxI - minI || 1;
+
+                    // Second pass: fill positions & colors (map intensity via HSL colormap)
+                    const color = new THREE.Color();
+                    for (let p = 0, i = 0; p < numPoints; p++, i += 4) {
+                        const x = floatArray[i];
+                        const y = floatArray[i + 1];
+                        const z = floatArray[i + 2];
+                        const intensity = floatArray[i + 3];
+
+                        positions[p * 3] = x;
+                        positions[p * 3 + 1] = y;
+                        positions[p * 3 + 2] = z;
+
+                        const t = (intensity - minI) / rangeI; // 0..1
+                        // Hue from 240deg (blue) to 0deg (red)
+                        color.setHSL((1 - t) * 2/3, 1.0, 0.5);
+                        colors[p * 3] = color.r;
+                        colors[p * 3 + 1] = color.g;
+                        colors[p * 3 + 2] = color.b;
+                    }
+
+                    const geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    geometry.computeBoundingBox();
+
+                    const material = new THREE.PointsMaterial({ size: pointSize, vertexColors: true });
+                    const points = new THREE.Points(geometry, material);
+                    setModel(points);
                 }
             } catch (err: any) {
-                setError(`解析PCD文件失败: ${err.message}`);
-                console.error('Error parsing PCD file:', err);
+                setError(`解析文件失败: ${err.message}`);
+                console.error('Error parsing point cloud file:', err);
             } finally {
                 setIsLoading(false);
             }
         };
         reader.readAsArrayBuffer(file);
-    }, []); // Rerun onDrop if pointSize changes to re-apply size
+    }, []); // Future: include pointSize if wanting to re-parse with new size
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
         maxFiles: 1,
         accept: {
             'model/x-pointcloud': ['.pcd'],
+            'application/octet-stream': ['.bin'],
         },
     });
 
@@ -74,7 +127,7 @@ export default function PcdViewerPage() {
             <Link href="/" className="absolute top-4 left-4 bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-md transition duration-300 ease-in-out">
                 &lt; 返回首页
             </Link>
-            <h1 className="text-4xl font-bold mb-4 text-gray-800">PCD 文件预览 (3D)</h1>
+            <h1 className="text-4xl font-bold mb-4 text-gray-800">PCD / BIN 文件预览 (3D)</h1>
 
             <div
                 {...getRootProps()}
@@ -84,7 +137,7 @@ export default function PcdViewerPage() {
                 {
                     isDragActive ?
                         <p className="text-gray-600">松开文件即可上传...</p> :
-                        <p className="text-gray-600">将 PCD 文件拖放到此处，或点击选择文件</p>
+                        <p className="text-gray-600">将 PCD 或 BIN 文件拖放到此处，或点击选择文件</p>
                 }
             </div>
 
@@ -111,7 +164,7 @@ export default function PcdViewerPage() {
                     </div>
                 )}
             </div>
-            <p className="mt-4 text-gray-600">此处将加载并显示PCD点云数据。</p>
+            <p className="mt-4 text-gray-600">此处将加载并显示点云数据（支持 .pcd / .bin，BIN 默认按 xyzi 解析）。</p>
         </div>
     );
-} 
+}
