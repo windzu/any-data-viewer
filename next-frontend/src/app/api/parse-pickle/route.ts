@@ -1,41 +1,27 @@
 import { NextResponse } from 'next/server';
 
-export async function POST(request: Request) {
+export async function POST(req: Request) {
+  // 直接把上传的 formData 转发给 Python 后端
+  const formData = await req.formData();
+  const pythonBackendUrl =
+    process.env.PYTHON_BACKEND_URL || 'http://localhost:5000/parse-pickle';
+
   try {
-    const formData = await request.formData();
-    const file = formData.get('file') as File;
+    const pyRes = await fetch(pythonBackendUrl, { method: 'POST', body: formData });
 
-    if (!file) {
-      return NextResponse.json({ error: 'No file uploaded.' }, { status: 400 });
-    }
+    // 永远不在这里 throw，原样透传状态码与响应体
+    const contentType = pyRes.headers.get('content-type') || 'application/json';
+    const bodyText = await pyRes.text();
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // In a real application, you would send this buffer to a Python backend.
-    // For now, let's create a new FormData to forward it.
-
-    const pythonBackendFormData = new FormData();
-    pythonBackendFormData.append('file', new Blob([buffer], { type: file.type }), file.name);
-
-    // IMPORTANT: Replace with your actual Python backend URL if different
-    const pythonBackendUrl = process.env.PYTHON_BACKEND_URL || 'http://localhost:5000/parse-pickle';
-
-    const pythonBackendResponse = await fetch(pythonBackendUrl, {
-      method: 'POST',
-      body: pythonBackendFormData,
+    return new Response(bodyText, {
+      status: pyRes.status,
+      headers: { 'content-type': contentType },
     });
-
-    if (!pythonBackendResponse.ok) {
-      const errorData = await pythonBackendResponse.text();
-      throw new Error(`Python backend error: ${pythonBackendResponse.status} - ${errorData}`);
-    }
-
-    const data = await pythonBackendResponse.json();
-    return NextResponse.json({ content: data.parsed_content });
-
-  } catch (error: any) {
-    console.error('Error in parse-pickle API route:', error);
-    return NextResponse.json({ error: error.message || 'Failed to parse pickle file.' }, { status: 500 });
+  } catch (e: any) {
+    // 只有网络异常等不可达情况才会走到这里
+    return NextResponse.json(
+      { ok: false, error: `Proxy error: ${e?.message || String(e)}` },
+      { status: 502 },
+    );
   }
-} 
+}
