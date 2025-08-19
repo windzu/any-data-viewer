@@ -12,20 +12,26 @@ import { solarizedlight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 let pyodidePromise: Promise<any> | null = null;
 async function getPyodide() {
     if (pyodidePromise) return pyodidePromise;
-    // 通过 <script> 注入，避免 Turbopack 对远程 import 的处理错误
     pyodidePromise = new Promise((resolve, reject) => {
         if (typeof window === 'undefined') {
             reject(new Error('Pyodide can only load in browser'));
             return;
         }
+        const finishInit = async (py: any) => {
+            try {
+                // 确保 numpy 已安装
+                await py.loadPackage('numpy');
+                injectPythonHelpers(py);
+                resolve(py);
+            } catch (e) {
+                reject(e);
+            }
+        };
         const existing = document.querySelector('script[data-pyodide]') as HTMLScriptElement | null;
         if (existing && (window as any).loadPyodide) {
             (window as any)
                 .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
-                .then((py: any) => {
-                    injectPythonHelpers(py);
-                    resolve(py);
-                })
+                .then(finishInit)
                 .catch(reject);
             return;
         }
@@ -36,10 +42,7 @@ async function getPyodide() {
         script.onload = () => {
             (window as any)
                 .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
-                .then((py: any) => {
-                    injectPythonHelpers(py);
-                    resolve(py);
-                })
+                .then(finishInit)
                 .catch(reject);
         };
         script.onerror = () => reject(new Error('Pyodide script load failed'));
