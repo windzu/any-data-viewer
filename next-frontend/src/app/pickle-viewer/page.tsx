@@ -6,6 +6,24 @@ import { useDropzone } from 'react-dropzone';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { solarizedlight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
+// 新增：懒加载 Pyodide
+
+// 轻量状态缓存，避免多次下载
+let pyodidePromise: Promise<any> | null = null;
+async function getPyodide() {
+    if (!pyodidePromise) {
+        // 使用官方 CDN，可按需换源
+        // @ts-ignore
+        pyodidePromise = import('https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.mjs').then(async (mod: any) => {
+            const py = await mod.loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' });
+            // 预注入 Python 代码：安全反序列化 + 序列化为 JSON 字符串
+            py.runPython(`\nimport io, pickle, math, json, base64\nimport numpy as np\n\nfrom typing import Any\n\n# 安全 Unpickler: 禁止自定义类\nclass SafeUnpickler(pickle.Unpickler):\n    allowed_builtins = {\n        'builtins': {\n            'list','dict','set','tuple','str','int','float','bool','complex','bytes','bytearray','frozenset','range','slice'\n        }\n    }\n    def find_class(self, module, name):\n        if module in self.allowed_builtins and name in self.allowed_builtins[module]:\n            return getattr(__import__(module), name)\n        if module == 'numpy' and name in {'ndarray'}:\n            import numpy as np\n            return getattr(np, name)\n        raise pickle.UnpicklingError(f'Blocked class: {module}.{name}')\n\n def sanitize_json_numbers(x):\n    if isinstance(x, float):\n        if math.isnan(x) or math.isinf(x):\n            return None\n        return x\n    import numpy as _np\n    if isinstance(x, (_np.floating,)):\n        v = float(x)\n        return None if (math.isnan(v) or math.isinf(v)) else v\n    if isinstance(x, (_np.integer,)):\n        return int(x)\n    if isinstance(x, (_np.bool_,)):\n        return bool(x)\n    if isinstance(x, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(x)).decode()}\n    if isinstance(x, dict):\n        return {k: sanitize_json_numbers(v) for k,v in x.items()}\n    if isinstance(x, (list, tuple, set)):\n        return [sanitize_json_numbers(v) for v in x]\n    return x\n\n def summarize_array(arr, sample_n=10):\n    import numpy as _np\n    flat = arr.ravel()\n    finite = flat[_np.isfinite(flat)] if flat.size else flat\n    min_v = float(finite.min()) if finite.size else None\n    max_v = float(finite.max()) if finite.size else None\n    sample = flat[:sample_n].tolist()\n    sample = sanitize_json_numbers(sample)\n    return {\n        '__ndarray__': True,\n        'dtype': str(arr.dtype),\n        'shape': list(arr.shape),\n        'min': min_v,\n        'max': max_v,\n        'sample': sample,\n    }\n\n def to_serializable(obj, summarize_large=True, elem_threshold=20000):\n    import numpy as _np\n    if isinstance(obj, _np.ndarray):\n        if summarize_large and obj.size > elem_threshold:\n            return summarize_array(obj)\n        return sanitize_json_numbers(obj.tolist())\n    if isinstance(obj, (_np.integer, _np.floating, _np.bool_)):\n        return sanitize_json_numbers(obj.item())\n    if isinstance(obj, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(obj)).decode()}\n    if isinstance(obj, set):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, tuple):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, dict):\n        return {k: to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for k,v in obj.items()}\n    if isinstance(obj, list):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    return sanitize_json_numbers(obj)\n\n def parse_pickle_bytes(b: bytes):\n    bio = io.BytesIO(b)\n    obj = SafeUnpickler(bio).load()\n    safe = to_serializable(obj, summarize_large=True, elem_threshold=20000)\n    return json.dumps({'ok': True, 'parsed_content': safe}, ensure_ascii=False, allow_nan=False)\n`);
+            return py;
+        });
+    }
+    return pyodidePromise;
+}
+
 type DisplayFormat = 'json' | 'txt' | 'dict';
 
 function toDisplayString(val: unknown): string {
@@ -34,9 +52,8 @@ export default function PickleViewerPage() {
         setFileName(file.name);
         setIsLoading(true);
         setError(null);
-        setFileContent(''); // 清空旧内容
+        setFileContent('');
 
-        // 基础校验
         if (
             file.type !== 'application/octet-stream' &&
             !file.name.endsWith('.pkl') &&
@@ -47,37 +64,29 @@ export default function PickleViewerPage() {
             return;
         }
 
-        const formData = new FormData();
-        formData.append('file', file);
-
         try {
-            const response = await fetch('/api/parse-pickle', {
-                method: 'POST',
-                body: formData,
-            });
-
-            const text = await response.text(); // 先拿文本，避免 JSON.parse 在 NaN/Inf 上崩
+            const buf = await file.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            const py = await getPyodide();
+            // 将数据写入虚拟文件系统
+            const resultJson = py.runPython(`parse_pickle_bytes(__import__('builtins').bytes(${Array.from(bytes)}))`);
             let body: any;
             try {
-                body = JSON.parse(text);
-            } catch {
-                // 后端若非 JSON，直接把原文当作错误信息展示
-                setError(`后端返回非 JSON：${text}`);
+                body = JSON.parse(resultJson);
+            } catch (e) {
+                setError('解析结果不是有效 JSON');
                 return;
             }
-
-            if (!response.ok || !body?.ok) {
-                setError(body?.error || `HTTP ${response.status}`);
+            if (!body?.ok) {
+                setError(body?.error || '解析失败');
                 return;
             }
-
-            // 后端可能是 { content } 或 { parsed_content }
-            const content = body?.content ?? body?.parsed_content ?? body;
-            setFileContent(toDisplayString(content)); // ✅ 统一转成字符串
+            const content = body.parsed_content;
+            setFileContent(toDisplayString(content));
         } catch (err: any) {
-            setError(`解析文件失败: ${err?.message || String(err)}`);
+            setError(`本地解析失败: ${err?.message || String(err)}`);
             // eslint-disable-next-line no-console
-            console.error('Error parsing pickle file:', err);
+            console.error('Local pickle parse error:', err);
         } finally {
             setIsLoading(false);
         }
@@ -140,7 +149,7 @@ export default function PickleViewerPage() {
                 {isDragActive ? (
                     <p className="text-gray-600">松开文件即可上传...</p>
                 ) : (
-                    <p className="text-gray-600">将 Pickle 文件拖放到此处，或点击选择文件</p>
+                    <p className="text-gray-600">将 Pickle 文件拖放到此处，或点击选择文件（前端本地解析，无上传）</p>
                 )}
             </div>
 
@@ -148,7 +157,7 @@ export default function PickleViewerPage() {
                 <p className="text-lg font-medium text-gray-700 mb-2">已选择文件: {fileName}</p>
             )}
             {isLoading && (
-                <p className="text-lg font-medium text-blue-600 mb-2">正在解析文件，请稍候...</p>
+                <p className="text-lg font-medium text-blue-600 mb-2">加载/解析中，首次使用需下载 Pyodide 体积较大...</p>
             )}
             {error && (
                 <p className="text-lg font-medium text-red-600 mb-4">错误: {error}</p>
