@@ -11,17 +11,49 @@ import { solarizedlight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 // 轻量状态缓存，避免多次下载
 let pyodidePromise: Promise<any> | null = null;
 async function getPyodide() {
-    if (!pyodidePromise) {
-        // 使用官方 CDN，可按需换源
-        // @ts-ignore
-        pyodidePromise = import('https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.mjs').then(async (mod: any) => {
-            const py = await mod.loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' });
-            // 预注入 Python 代码：安全反序列化 + 序列化为 JSON 字符串
-            py.runPython(`\nimport io, pickle, math, json, base64\nimport numpy as np\n\nfrom typing import Any\n\n# 安全 Unpickler: 禁止自定义类\nclass SafeUnpickler(pickle.Unpickler):\n    allowed_builtins = {\n        'builtins': {\n            'list','dict','set','tuple','str','int','float','bool','complex','bytes','bytearray','frozenset','range','slice'\n        }\n    }\n    def find_class(self, module, name):\n        if module in self.allowed_builtins and name in self.allowed_builtins[module]:\n            return getattr(__import__(module), name)\n        if module == 'numpy' and name in {'ndarray'}:\n            import numpy as np\n            return getattr(np, name)\n        raise pickle.UnpicklingError(f'Blocked class: {module}.{name}')\n\n def sanitize_json_numbers(x):\n    if isinstance(x, float):\n        if math.isnan(x) or math.isinf(x):\n            return None\n        return x\n    import numpy as _np\n    if isinstance(x, (_np.floating,)):\n        v = float(x)\n        return None if (math.isnan(v) or math.isinf(v)) else v\n    if isinstance(x, (_np.integer,)):\n        return int(x)\n    if isinstance(x, (_np.bool_,)):\n        return bool(x)\n    if isinstance(x, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(x)).decode()}\n    if isinstance(x, dict):\n        return {k: sanitize_json_numbers(v) for k,v in x.items()}\n    if isinstance(x, (list, tuple, set)):\n        return [sanitize_json_numbers(v) for v in x]\n    return x\n\n def summarize_array(arr, sample_n=10):\n    import numpy as _np\n    flat = arr.ravel()\n    finite = flat[_np.isfinite(flat)] if flat.size else flat\n    min_v = float(finite.min()) if finite.size else None\n    max_v = float(finite.max()) if finite.size else None\n    sample = flat[:sample_n].tolist()\n    sample = sanitize_json_numbers(sample)\n    return {\n        '__ndarray__': True,\n        'dtype': str(arr.dtype),\n        'shape': list(arr.shape),\n        'min': min_v,\n        'max': max_v,\n        'sample': sample,\n    }\n\n def to_serializable(obj, summarize_large=True, elem_threshold=20000):\n    import numpy as _np\n    if isinstance(obj, _np.ndarray):\n        if summarize_large and obj.size > elem_threshold:\n            return summarize_array(obj)\n        return sanitize_json_numbers(obj.tolist())\n    if isinstance(obj, (_np.integer, _np.floating, _np.bool_)):\n        return sanitize_json_numbers(obj.item())\n    if isinstance(obj, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(obj)).decode()}\n    if isinstance(obj, set):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, tuple):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, dict):\n        return {k: to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for k,v in obj.items()}\n    if isinstance(obj, list):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    return sanitize_json_numbers(obj)\n\n def parse_pickle_bytes(b: bytes):\n    bio = io.BytesIO(b)\n    obj = SafeUnpickler(bio).load()\n    safe = to_serializable(obj, summarize_large=True, elem_threshold=20000)\n    return json.dumps({'ok': True, 'parsed_content': safe}, ensure_ascii=False, allow_nan=False)\n`);
-            return py;
-        });
-    }
+    if (pyodidePromise) return pyodidePromise;
+    // 通过 <script> 注入，避免 Turbopack 对远程 import 的处理错误
+    pyodidePromise = new Promise((resolve, reject) => {
+        if (typeof window === 'undefined') {
+            reject(new Error('Pyodide can only load in browser'));
+            return;
+        }
+        const existing = document.querySelector('script[data-pyodide]') as HTMLScriptElement | null;
+        if (existing && (window as any).loadPyodide) {
+            (window as any)
+                .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
+                .then((py: any) => {
+                    injectPythonHelpers(py);
+                    resolve(py);
+                })
+                .catch(reject);
+            return;
+        }
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
+        script.async = true;
+        script.dataset.pyodide = 'true';
+        script.onload = () => {
+            (window as any)
+                .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
+                .then((py: any) => {
+                    injectPythonHelpers(py);
+                    resolve(py);
+                })
+                .catch(reject);
+        };
+        script.onerror = () => reject(new Error('Pyodide script load failed'));
+        document.head.appendChild(script);
+    });
     return pyodidePromise;
+}
+
+function injectPythonHelpers(py: any) {
+    // 避免重复注入
+    if ((py as any)._pickleHelpersInjected) return;
+    const pythonCode = `import io, pickle, math, json, base64\nimport numpy as np\n\n# 安全 Unpickler: 禁止自定义类\nclass SafeUnpickler(pickle.Unpickler):\n    allowed_builtins = {\n        'builtins': {\n            'list','dict','set','tuple','str','int','float','bool','complex','bytes','bytearray','frozenset','range','slice'\n        }\n    }\n    def find_class(self, module, name):\n        if module in self.allowed_builtins and name in self.allowed_builtins[module]:\n            return getattr(__import__(module), name)\n        if module == 'numpy' and name in {'ndarray'}:\n            import numpy as _np\n            return getattr(_np, name)\n        raise pickle.UnpicklingError(f'Blocked class: {module}.{name}')\n\ndef sanitize_json_numbers(x):\n    if isinstance(x, float):\n        if math.isnan(x) or math.isinf(x):\n            return None\n        return x\n    import numpy as _np\n    if isinstance(x, (_np.floating,)):\n        v = float(x)\n        return None if (math.isnan(v) or math.isinf(v)) else v\n    if isinstance(x, (_np.integer,)):\n        return int(x)\n    if isinstance(x, (_np.bool_,)):\n        return bool(x)\n    if isinstance(x, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(x)).decode()}\n    if isinstance(x, dict):\n        return {k: sanitize_json_numbers(v) for k,v in x.items()}\n    if isinstance(x, (list, tuple, set)):\n        return [sanitize_json_numbers(v) for v in x]\n    return x\n\ndef summarize_array(arr, sample_n=10):\n    import numpy as _np\n    flat = arr.ravel()\n    finite = flat[_np.isfinite(flat)] if flat.size else flat\n    min_v = float(finite.min()) if finite.size else None\n    max_v = float(finite.max()) if finite.size else None\n    sample = flat[:sample_n].tolist()\n    sample = sanitize_json_numbers(sample)\n    return {\n        '__ndarray__': True,\n        'dtype': str(arr.dtype),\n        'shape': list(arr.shape),\n        'min': min_v,\n        'max': max_v,\n        'sample': sample,\n    }\n\ndef to_serializable(obj, summarize_large=True, elem_threshold=20000):\n    import numpy as _np\n    if isinstance(obj, _np.ndarray):\n        if summarize_large and obj.size > elem_threshold:\n            return summarize_array(obj)\n        return sanitize_json_numbers(obj.tolist())\n    if isinstance(obj, (_np.integer, _np.floating, _np.bool_)):\n        return sanitize_json_numbers(obj.item())\n    if isinstance(obj, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(obj)).decode()}\n    if isinstance(obj, set):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, tuple):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, dict):\n        return {k: to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for k,v in obj.items()}\n    if isinstance(obj, list):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    return sanitize_json_numbers(obj)\n\ndef parse_pickle_bytes(b: bytes):\n    bio = io.BytesIO(b)\n    obj = SafeUnpickler(bio).load()\n    safe = to_serializable(obj, summarize_large=True, elem_threshold=20000)\n    return json.dumps({'ok': True, 'parsed_content': safe}, ensure_ascii=False, allow_nan=False)`;
+    py.runPython(pythonCode);
+    (py as any)._pickleHelpersInjected = true;
 }
 
 type DisplayFormat = 'json' | 'txt' | 'dict';
@@ -68,8 +100,10 @@ export default function PickleViewerPage() {
             const buf = await file.arrayBuffer();
             const bytes = new Uint8Array(buf);
             const py = await getPyodide();
-            // 将数据写入虚拟文件系统
-            const resultJson = py.runPython(`parse_pickle_bytes(__import__('builtins').bytes(${Array.from(bytes)}))`);
+            // 直接在内存中把 Uint8Array 转成 Python bytes 传递
+            // 构造 bytes(...) 字面量会很长；用 py.runPython + FS 方案更高效，这里简单处理即可
+            const arrayLiteral = `[${Array.from(bytes).join(',')}]`;
+            const resultJson = py.runPython(`parse_pickle_bytes(bytes(${arrayLiteral}))`);
             let body: any;
             try {
                 body = JSON.parse(resultJson);
