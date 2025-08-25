@@ -1,6 +1,7 @@
 'use client';
 
 import { popPendingFile } from '@/lib/pendingFiles';
+import { Pyodide } from '@/types/pyodide';
 import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
@@ -10,15 +11,15 @@ import { solarizedlight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 // 新增：懒加载 Pyodide
 
 // 轻量状态缓存，避免多次下载
-let pyodidePromise: Promise<any> | null = null;
+let pyodidePromise: Promise<Pyodide> | null = null;
 async function getPyodide() {
     if (pyodidePromise) return pyodidePromise;
-    pyodidePromise = new Promise((resolve, reject) => {
+    pyodidePromise = new Promise<Pyodide>((resolve, reject) => {
         if (typeof window === 'undefined') {
             reject(new Error('Pyodide can only load in browser'));
             return;
         }
-        const finishInit = async (py: any) => {
+        const finishInit = async (py: Pyodide) => {
             try {
                 // 确保 numpy 已安装
                 await py.loadPackage('numpy');
@@ -29,8 +30,8 @@ async function getPyodide() {
             }
         };
         const existing = document.querySelector('script[data-pyodide]') as HTMLScriptElement | null;
-        if (existing && (window as any).loadPyodide) {
-            (window as any)
+        if (existing && window.loadPyodide) {
+            window
                 .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
                 .then(finishInit)
                 .catch(reject);
@@ -41,7 +42,11 @@ async function getPyodide() {
         script.async = true;
         script.dataset.pyodide = 'true';
         script.onload = () => {
-            (window as any)
+            if (!window.loadPyodide) {
+                reject(new Error('loadPyodide not found on window'));
+                return;
+            }
+            window
                 .loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' })
                 .then(finishInit)
                 .catch(reject);
@@ -52,12 +57,12 @@ async function getPyodide() {
     return pyodidePromise;
 }
 
-function injectPythonHelpers(py: any) {
+function injectPythonHelpers(py: Pyodide) {
     // 避免重复注入
-    if ((py as any)._pickleHelpersInjected) return;
+    if (py._pickleHelpersInjected) return;
     const pythonCode = `import io, pickle, math, json, base64\nimport numpy as np\n\n# 安全 Unpickler: 禁止自定义类，仅放行 numpy 构造 array 所需的最小集合\nclass SafeUnpickler(pickle.Unpickler):\n    allowed_builtins = {\n        'builtins': {\n            'list','dict','set','tuple','str','int','float','bool','complex','bytes','bytearray','frozenset','range','slice'\n        }\n    }\n    # 允许的 numpy 相关 (重建 ndarray / dtype 时常见)\n    allowed_numpy = {('numpy','ndarray'), ('numpy','dtype')}\n    allowed_numpy_core_multiarray = {'_reconstruct', 'scalar'}\n    allowed_codecs = {'encode','decode'}  # 某些 numpy / dtype 的旧 pickle 需要 _codecs.encode\n    def find_class(self, module, name):\n        if module in self.allowed_builtins and name in self.allowed_builtins[module]:\n            return getattr(__import__(module), name)\n        if (module, name) in self.allowed_numpy:\n            return getattr(__import__(module), name)\n        if module == 'numpy.core.multiarray' and name in self.allowed_numpy_core_multiarray:\n            mod = __import__('numpy.core.multiarray', fromlist=[name])\n            return getattr(mod, name)\n        if module == '_codecs' and name in self.allowed_codecs:\n            mod = __import__('_codecs')\n            return getattr(mod, name)\n        raise pickle.UnpicklingError(f'Blocked class: {module}.{name}')\n\ndef sanitize_json_numbers(x):\n    if isinstance(x, float):\n        if math.isnan(x) or math.isinf(x):\n            return None\n        return x\n    import numpy as _np\n    if isinstance(x, (_np.floating,)):\n        v = float(x)\n        return None if (math.isnan(v) or math.isinf(v)) else v\n    if isinstance(x, (_np.integer,)):\n        return int(x)\n    if isinstance(x, (_np.bool_,)):\n        return bool(x)\n    if isinstance(x, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(x)).decode()}\n    if isinstance(x, dict):\n        return {k: sanitize_json_numbers(v) for k,v in x.items()}\n    if isinstance(x, (list, tuple, set)):\n        return [sanitize_json_numbers(v) for v in x]\n    return x\n\ndef summarize_array(arr, sample_n=10):\n    import numpy as _np\n    flat = arr.ravel()\n    finite = flat[_np.isfinite(flat)] if flat.size else flat\n    min_v = float(finite.min()) if finite.size else None\n    max_v = float(finite.max()) if finite.size else None\n    sample = flat[:sample_n].tolist()\n    sample = sanitize_json_numbers(sample)\n    return {\n        '__ndarray__': True,\n        'dtype': str(arr.dtype),\n        'shape': list(arr.shape),\n        'min': min_v,\n        'max': max_v,\n        'sample': sample,\n    }\n\ndef to_serializable(obj, summarize_large=True, elem_threshold=20000):\n    import numpy as _np\n    if isinstance(obj, _np.ndarray):\n        if summarize_large and obj.size > elem_threshold:\n            return summarize_array(obj)\n        return sanitize_json_numbers(obj.tolist())\n    if isinstance(obj, (_np.integer, _np.floating, _np.bool_)):\n        return sanitize_json_numbers(obj.item())\n    if isinstance(obj, (bytes, bytearray, memoryview)):\n        return {'__bytes__': True, 'base64': base64.b64encode(bytes(obj)).decode()}\n    if isinstance(obj, set):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, tuple):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    if isinstance(obj, dict):\n        return {k: to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for k,v in obj.items()}\n    if isinstance(obj, list):\n        return [to_serializable(v, summarize_large=summarize_large, elem_threshold=elem_threshold) for v in obj]\n    return sanitize_json_numbers(obj)\n\ndef parse_pickle_bytes(b: bytes):\n    try:\n        bio = io.BytesIO(b)\n        obj = SafeUnpickler(bio).load()\n        safe = to_serializable(obj, summarize_large=True, elem_threshold=20000)\n        return json.dumps({'ok': True, 'parsed_content': safe}, ensure_ascii=False, allow_nan=False)\n    except Exception as e:\n        return json.dumps({'ok': False, 'error': f'{type(e).__name__}: {e}'}, ensure_ascii=False, allow_nan=False)`;
     py.runPython(pythonCode);
-    (py as any)._pickleHelpersInjected = true;
+    py._pickleHelpersInjected = true;
 }
 
 type DisplayFormat = 'json' | 'txt' | 'dict';
@@ -91,21 +96,22 @@ export default function PickleViewerPage() {
             const py = await getPyodide();
             const tmpPath = '/tmp_upload.pkl';
             py.FS.writeFile(tmpPath, bytes);
-            let resultJson: string;
+            let resultJsonUnknown: unknown;
             try {
-                resultJson = py.runPython(`parse_pickle_bytes(open('${tmpPath}','rb').read())`);
+                resultJsonUnknown = py.runPython(`parse_pickle_bytes(open('${tmpPath}','rb').read())`);
             } finally {
                 try { py.FS.unlink(tmpPath); } catch { /* ignore */ }
             }
-            const body = JSON.parse(resultJson);
+            const resultJson = String(resultJsonUnknown);
+            const body = JSON.parse(resultJson) as { ok?: boolean; parsed_content?: unknown; error?: string };
             if (!body?.ok) {
                 setError(body?.error || '解析失败');
                 return;
             }
-            const content = body.parsed_content;
-            setFileContent(toDisplayString(content));
-        } catch (err: any) {
-            setError(`本地解析失败: ${err?.message || String(err)}`);
+            setFileContent(toDisplayString(body.parsed_content));
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setError(`本地解析失败: ${msg}`);
             console.error('Local pickle parse error:', err);
         } finally {
             setIsLoading(false);

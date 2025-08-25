@@ -87,8 +87,9 @@ export default function PcdViewerPage() {
                     const points = new THREE.Points(geometry, material);
                     setModel(points);
                 }
-            } catch (err: any) {
-                setError(`解析文件失败: ${err.message}`);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                setError(`解析文件失败: ${msg}`);
                 console.error('Error parsing point cloud file:', err);
             } finally {
                 setIsLoading(false);

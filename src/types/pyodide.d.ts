@@ -8,12 +8,16 @@ declare global {
 }
 
 export interface Pyodide {
-  runPython: (code: string) => any;
-  globals: any;
+  runPython: (code: string) => unknown;
+  globals: Record<string, unknown>;
+  loadPackage: (name: string) => Promise<void>;
   FS: {
     writeFile: (path: string, data: Uint8Array | string) => void;
     unlink: (path: string) => void;
   };
+  // internal flag we set to avoid duplicate helper injection
+  _pickleHelpersInjected?: boolean;
 }
 
-export {};
+export { };
+

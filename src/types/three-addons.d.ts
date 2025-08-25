@@ -50,19 +50,19 @@ declare module 'three/examples/jsm/controls/OrbitControls' {
     saveState(): void;
     reset(): void;
     // Event Listener
-    addEventListener(type: string, listener: (event: any) => void): void;
-    hasEventListener(type: string, listener: (event: any) => void): boolean;
-    removeEventListener(type: string, listener: (event: any) => void): void;
-    dispatchEvent(event: { type: string; target: any }): void;
+    addEventListener(type: string, listener: (event: unknown) => void): void;
+    hasEventListener(type: string, listener: (event: unknown) => void): boolean;
+    removeEventListener(type: string, listener: (event: unknown) => void): void;
+    dispatchEvent(event: { type: string; target: unknown }): void;
   }
 }
 
 declare module 'three/examples/jsm/loaders/PCDLoader' {
-  import { LoadingManager, Points } from 'three';
+  import { EventDispatcher, LoadingManager, Points } from 'three';
 
   export class PCDLoader extends EventDispatcher {
     constructor(manager?: LoadingManager);
     load(url: string, onLoad: (points: Points) => void, onProgress?: (event: ProgressEvent) => void, onError?: (event: ErrorEvent) => void): void;
     parse(data: ArrayBuffer | string): Points;
   }
-} 
+}

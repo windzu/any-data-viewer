@@ -10,7 +10,7 @@ export default function UploadPage() {
     const [status, setStatus] = useState<string>('');
     const router = useRouter();
 
-    const handleRouteByExt = (file: File) => {
+    const handleRouteByExt = useCallback((file: File) => {
         const name = file.name.toLowerCase();
         if (name.endsWith('.pcd') || name.endsWith('.bin')) {
             setPendingFile('pointcloud', file);
@@ -25,14 +25,14 @@ export default function UploadPage() {
             return;
         }
         setStatus('不支持的文件类型，请选择 .pcd / .bin / .pkl / .pickle');
-    };
+    }, [router]);
 
     const onDrop = useCallback((acceptedFiles: File[]) => {
         if (!acceptedFiles.length) return;
         const file = acceptedFiles[0]; // 仅处理首个
         setFiles([file]);
         handleRouteByExt(file);
-    }, []);
+    }, [handleRouteByExt]);
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, maxFiles: 1 });
 
