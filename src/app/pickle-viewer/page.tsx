@@ -1,7 +1,8 @@
 'use client';
 
+import { popPendingFile } from '@/lib/pendingFiles';
 import Link from 'next/link';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { solarizedlight } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -75,35 +76,19 @@ export default function PickleViewerPage() {
     const [fileName, setFileName] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
+    const [info, setInfo] = useState<string | null>(null);
     const [displayFormat, setDisplayFormat] = useState<DisplayFormat>('json');
     const [copyButtonText, setCopyButtonText] = useState('复制');
 
-    const onDrop = useCallback(async (acceptedFiles: File[]) => {
-        if (acceptedFiles.length === 0) {
-            setError('请选择一个文件。');
-            return;
-        }
-        const file = acceptedFiles[0];
+    const parsePickle = useCallback(async (file: File) => {
         setFileName(file.name);
         setIsLoading(true);
         setError(null);
         setFileContent('');
-
-        if (
-            file.type !== 'application/octet-stream' &&
-            !file.name.endsWith('.pkl') &&
-            !file.name.endsWith('.pickle')
-        ) {
-            setError('请上传有效的 Pickle 文件（.pkl 或 .pickle 格式）。');
-            setIsLoading(false);
-            return;
-        }
-
         try {
             const buf = await file.arrayBuffer();
             const bytes = new Uint8Array(buf);
             const py = await getPyodide();
-            // 使用虚拟文件系统写入，避免构造超长 Python 源导致 MemoryError
             const tmpPath = '/tmp_upload.pkl';
             py.FS.writeFile(tmpPath, bytes);
             let resultJson: string;
@@ -112,13 +97,7 @@ export default function PickleViewerPage() {
             } finally {
                 try { py.FS.unlink(tmpPath); } catch { /* ignore */ }
             }
-            let body: any;
-            try {
-                body = JSON.parse(resultJson);
-            } catch (e) {
-                setError('解析结果不是有效 JSON');
-                return;
-            }
+            const body = JSON.parse(resultJson);
             if (!body?.ok) {
                 setError(body?.error || '解析失败');
                 return;
@@ -127,12 +106,39 @@ export default function PickleViewerPage() {
             setFileContent(toDisplayString(content));
         } catch (err: any) {
             setError(`本地解析失败: ${err?.message || String(err)}`);
-            // eslint-disable-next-line no-console
             console.error('Local pickle parse error:', err);
         } finally {
             setIsLoading(false);
         }
     }, []);
+
+    useEffect(() => {
+        const pending = popPendingFile('pickle');
+        if (pending) {
+            setInfo('已从上传页带入文件，正在解析...');
+            parsePickle(pending);
+            const t = setTimeout(() => setInfo(null), 1500);
+            return () => clearTimeout(t);
+        }
+        return;
+    }, [parsePickle]);
+
+    const onDrop = useCallback(async (acceptedFiles: File[]) => {
+        if (acceptedFiles.length === 0) {
+            setError('请选择一个文件。');
+            return;
+        }
+        const file = acceptedFiles[0];
+        if (
+            file.type !== 'application/octet-stream' &&
+            !file.name.endsWith('.pkl') &&
+            !file.name.endsWith('.pickle')
+        ) {
+            setError('请上传有效的 Pickle 文件（.pkl 或 .pickle 格式）。');
+            return;
+        }
+        parsePickle(file);
+    }, [parsePickle]);
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
@@ -145,7 +151,6 @@ export default function PickleViewerPage() {
     const formattedContent = (): string => {
         if (!fileContent) return '';
         if (displayFormat === 'json' || displayFormat === 'dict') {
-            // 尝试把 fileContent 当 JSON 再美化一次；不行就原样返回
             try {
                 return JSON.stringify(JSON.parse(fileContent), null, 2);
             } catch {
@@ -163,14 +168,13 @@ export default function PickleViewerPage() {
             setCopyButtonText('已复制！');
             setTimeout(() => setCopyButtonText('复制'), 2000);
         } catch (err) {
-            // eslint-disable-next-line no-console
             console.error('Failed to copy: ', err);
             setCopyButtonText('复制失败！');
             setTimeout(() => setCopyButtonText('复制'), 2000);
         }
     };
 
-    const codeString = formattedContent(); // ✅ 确保传入高亮器的是 string
+    const codeString = formattedContent();
 
     return (
         <div className="flex flex-col items-center min-h-screen bg-gray-100 p-4">
@@ -182,6 +186,12 @@ export default function PickleViewerPage() {
             </Link>
 
             <h1 className="text-4xl font-bold mb-4 text-gray-800">Pickle 文件预览</h1>
+
+            {info && (
+                <div className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 px-3 py-2 rounded">
+                    {info}
+                </div>
+            )}
 
             <div
                 {...getRootProps()}
@@ -257,7 +267,7 @@ export default function PickleViewerPage() {
                             customStyle={{ background: 'transparent' }}
                             wrapLongLines
                         >
-                            {codeString /* ✅ 始终是 string */}
+                            {codeString}
                         </SyntaxHighlighter>
                     )}
                 </div>

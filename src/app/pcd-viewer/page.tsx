@@ -1,7 +1,8 @@
 'use client';
 
+import { popPendingFile } from '@/lib/pendingFiles';
 import Link from 'next/link';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import * as THREE from 'three';
 import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
@@ -12,22 +13,17 @@ export default function PcdViewerPage() {
     const [fileName, setFileName] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
+    const [info, setInfo] = useState<string | null>(null);
     const [pointSize, setPointSize] = useState<number>(0.01); // Default point size
 
-    const onDrop = useCallback(async (acceptedFiles: File[]) => {
-        if (acceptedFiles.length === 0) {
-            setError('请选择一个文件。');
-            return;
-        }
-        const file = acceptedFiles[0];
+    const parsePointCloudFile = useCallback(async (file: File) => {
         setFileName(file.name);
         setIsLoading(true);
         setError(null);
-        setModel(null); // Clear previous model
+        setModel(null);
 
         const isPCD = file.name.toLowerCase().endsWith('.pcd');
         const isBIN = file.name.toLowerCase().endsWith('.bin');
-
         if (!isPCD && !isBIN) {
             setError('请上传有效的 PCD 或 BIN 文件（.pcd / .bin 格式）。');
             setIsLoading(false);
@@ -38,9 +34,7 @@ export default function PcdViewerPage() {
         reader.onload = async (event) => {
             try {
                 if (!event.target?.result) return;
-
                 if (isPCD) {
-                    // Parse PCD
                     const loader = new PCDLoader();
                     const loadedModel = loader.parse(event.target.result as ArrayBuffer);
                     if (loadedModel instanceof THREE.Points) {
@@ -54,7 +48,6 @@ export default function PcdViewerPage() {
                     }
                     setModel(loadedModel);
                 } else if (isBIN) {
-                    // Parse BIN (assume float32 xyzi)
                     const buffer = event.target.result as ArrayBuffer;
                     const floatArray = new Float32Array(buffer);
                     if (floatArray.length % 4 !== 0) {
@@ -63,8 +56,6 @@ export default function PcdViewerPage() {
                     const numPoints = floatArray.length / 4;
                     const positions = new Float32Array(numPoints * 3);
                     const colors = new Float32Array(numPoints * 3);
-
-                    // First pass: intensity range
                     let minI = Number.POSITIVE_INFINITY;
                     let maxI = Number.NEGATIVE_INFINITY;
                     for (let i = 0; i < floatArray.length; i += 4) {
@@ -73,32 +64,25 @@ export default function PcdViewerPage() {
                         if (intensity > maxI) maxI = intensity;
                     }
                     const rangeI = maxI - minI || 1;
-
-                    // Second pass: fill positions & colors (map intensity via HSL colormap)
                     const color = new THREE.Color();
                     for (let p = 0, i = 0; p < numPoints; p++, i += 4) {
                         const x = floatArray[i];
                         const y = floatArray[i + 1];
                         const z = floatArray[i + 2];
                         const intensity = floatArray[i + 3];
-
                         positions[p * 3] = x;
                         positions[p * 3 + 1] = y;
                         positions[p * 3 + 2] = z;
-
-                        const t = (intensity - minI) / rangeI; // 0..1
-                        // Hue from 240deg (blue) to 0deg (red)
-                        color.setHSL((1 - t) * 2/3, 1.0, 0.5);
+                        const t = (intensity - minI) / rangeI;
+                        color.setHSL((1 - t) * 2 / 3, 1.0, 0.5);
                         colors[p * 3] = color.r;
                         colors[p * 3 + 1] = color.g;
                         colors[p * 3 + 2] = color.b;
                     }
-
                     const geometry = new THREE.BufferGeometry();
                     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
                     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
                     geometry.computeBoundingBox();
-
                     const material = new THREE.PointsMaterial({ size: pointSize, vertexColors: true });
                     const points = new THREE.Points(geometry, material);
                     setModel(points);
@@ -111,7 +95,26 @@ export default function PcdViewerPage() {
             }
         };
         reader.readAsArrayBuffer(file);
-    }, []); // Future: include pointSize if wanting to re-parse with new size
+    }, [pointSize]);
+
+    useEffect(() => {
+        const pending = popPendingFile('pointcloud');
+        if (pending) {
+            setInfo('已从上传页带入文件，正在解析...');
+            parsePointCloudFile(pending);
+            const t = setTimeout(() => setInfo(null), 1500);
+            return () => clearTimeout(t);
+        }
+        return;
+    }, [parsePointCloudFile]);
+
+    const onDrop = useCallback(async (acceptedFiles: File[]) => {
+        if (acceptedFiles.length === 0) {
+            setError('请选择一个文件。');
+            return;
+        }
+        parsePointCloudFile(acceptedFiles[0]);
+    }, [parsePointCloudFile]);
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
@@ -128,6 +131,12 @@ export default function PcdViewerPage() {
                 &lt; 返回首页
             </Link>
             <h1 className="text-4xl font-bold mb-4 text-gray-800">PCD / BIN 文件预览 (3D)</h1>
+
+            {info && (
+                <div className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 px-3 py-2 rounded">
+                    {info}
+                </div>
+            )}
 
             <div
                 {...getRootProps()}
